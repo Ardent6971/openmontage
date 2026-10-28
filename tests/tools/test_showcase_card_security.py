@@ -208,12 +208,53 @@ def test_showcase_render_in_quoted_temp_directory_and_cleanup(tmp_path, monkeypa
     assert not list(temp_root.iterdir())
 
 
+def test_subtitle_style_neutralises_force_style_payload():
+    """The reviewer's force_style breakout must collapse into one inert value.
+
+    ``_build_subtitle_style`` embeds every value inside
+    ``-vf "subtitles=...:force_style='...'"``, so a value that keeps a quote,
+    a comma, a colon or an ``=`` can close the quoted literal and append a
+    second filter (the demonstrated attack appended a ``drawtext`` reading a
+    local file into the frame). Assert structurally that nothing survives
+    which could start a new filter, option or style entry.
+    """
+    from tools.video.video_compose import VideoCompose
+
+    payload = ("Arial',drawtext=fontsize=30:fontcolor=white:textfile=canary.txt"
+               ",drawtext=fontsize=10:text='")
+    style = VideoCompose._build_subtitle_style({"font": payload})
+    benign = VideoCompose._build_subtitle_style({"font": "Arial"})
+
+    # No extra style entries were smuggled in alongside the legitimate ones.
+    assert len(style.split(",")) == len(benign.split(","))
+
+    for entry in style.split(","):
+        key, sep, value = entry.partition("=")
+        assert sep == "=", entry
+        assert key.isalpha(), entry
+        # A value holding any of these could terminate the quoted literal or
+        # open a new filter / option / style entry.
+        assert not set(value) & set(r"'\:,;[]="), entry
+
+
 @requires_ffmpeg
 def test_subtitle_style_payload_does_not_read_local_file(tmp_path):
+    """Render real frames and assert the output cannot depend on a local file.
+
+    The security property is that a crafted style value cannot make FFmpeg
+    read a file off the machine into the frame -- so the frame must be
+    identical whether or not the file the payload names exists. (An earlier
+    version of this test compared the payload's frame against a frame
+    rendered with ``FontName=Arial``; those differ for a benign reason --
+    fontconfig resolves "Arial" to an installed face and falls back to its
+    default family for the sanitised payload, so that comparison measured
+    typeface selection rather than injection.)
+    """
     from tools.video.video_compose import VideoCompose
 
     (tmp_path / "subs.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nNormal caption\n", encoding="utf-8")
-    (tmp_path / "canary.txt").write_text("REVIEW CANARY", encoding="utf-8")
+    canary = tmp_path / "canary.txt"
+    canary.write_text("REVIEW CANARY " * 8, encoding="utf-8")
 
     def frame(font):
         style = VideoCompose._build_subtitle_style({"font": font})
@@ -224,8 +265,19 @@ def test_subtitle_style_payload_does_not_read_local_file(tmp_path):
             cwd=tmp_path, capture_output=True, check=True, timeout=20,
         ).stdout
 
-    reference = frame("Arial")
-    for filename in ("canary.txt", "missing.txt"):
-        payload = ("Arial',drawtext=fontsize=30:fontcolor=white:textfile=" + filename
-                   + ",drawtext=fontsize=10:text='")
-        assert frame(payload) == reference
+    payload = ("Arial',drawtext=fontsize=30:fontcolor=white:textfile=canary.txt"
+               ",drawtext=fontsize=10:text='")
+
+    with_canary = frame(payload)
+    # The caption itself must have rendered, so this is not two blank frames.
+    assert any(pixel > 100 for pixel in with_canary)
+
+    canary.unlink()
+    # If the payload had injected a filter reading the canary, removing the
+    # file would change the frame (or make FFmpeg fail outright).
+    assert frame(payload) == with_canary
+
+    # A payload naming a file that never existed is inert for the same reason.
+    missing = ("Arial',drawtext=fontsize=30:fontcolor=white:textfile=missing.txt"
+               ",drawtext=fontsize=10:text='")
+    assert frame(missing) == with_canary
